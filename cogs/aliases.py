@@ -43,13 +43,15 @@ class FakeResponse:
         self._message = message
         self._done = False
 
-    async def send_message(self, content: Any = None, *, embed: discord.Embed = None, view: discord.ui.View = None, ephemeral: bool = False, file: discord.File = None, files: list[discord.File] = None, **kwargs):
+    async def send_message(self, content: Any = None, *, embed: discord.Embed = None, embeds: list[discord.Embed] = None, view: discord.ui.View = None, ephemeral: bool = False, file: discord.File = None, files: list[discord.File] = None, **kwargs):
         self._done = True
         send_kwargs = {}
         if content is not None:
             send_kwargs["content"] = content
         if embed is not None:
             send_kwargs["embed"] = embed
+        if embeds is not None:
+            send_kwargs["embeds"] = embeds
         if view is not None:
             send_kwargs["view"] = view
         if file is not None:

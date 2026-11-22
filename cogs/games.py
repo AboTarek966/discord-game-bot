@@ -12,6 +12,9 @@ from utils.helpers import (
     HANGMAN_STAGES, SIMON_COLORS, EMOJI_WORDS, CARD_RANKS,
     random_choice, scramble_word, make_card, card_value, hand_value, format_hand,
 )
+from utils.roulette import (
+    BETS, BET_KEYS, bet_numbers, number_emoji, wheel_file, table_file,
+)
 
 games_state = {}
 
@@ -161,6 +164,12 @@ class Games(commands.Cog):
     async def russian(self, interaction: discord.Interaction):
         view = RussianView(interaction.user.id)
         await interaction.response.send_message(embed=view.make_embed(), view=view)
+
+    @app_commands.command(name="روليت", description="روليت أوروبي — اختر رهانك ودوّر العجلة")
+    async def roulette(self, interaction: discord.Interaction):
+        view = RouletteView(interaction.user.id)
+        embeds, files = view.payload(msg="اختر نوع الرهان وقيمة الرقاقة ثم اضغط **دوّر العجلة**.")
+        await interaction.response.send_message(embeds=embeds, view=view, files=files)
 
     @app_commands.command(name="ضرب", description="اختبار جدول الضرب")
     async def mult_table(self, interaction: discord.Interaction):
@@ -878,6 +887,261 @@ class RussianView(ui.View):
         for c in self.children:
             c.disabled = True
         await interaction.response.edit_message(embed=discord.Embed(title="🏳️ استسلام", description=f"نجوت من **{self.survived}** حجرات.", color=COLOR_WARNING), view=self)
+
+
+# ── روليت أوروبي ────────────────────────────────────────────────────────
+CHIP_VALUES = [10, 25, 50, 100, 250, 500]
+
+
+def _bet_options(bet_key: str, bet_value) -> list:
+    opts = []
+    for key in BET_KEYS:
+        b = BETS[key]
+        desc = b["desc"]
+        if key == "straight":
+            desc = f"الرقم {bet_value}" if bet_value is not None else "اختر رقمًا (0-36)"
+        opts.append(discord.SelectOption(
+            label=b["label"], value=key, emoji=b["emoji"],
+            description=desc, default=(key == bet_key),
+        ))
+    return opts
+
+
+def _chip_options(chips: int) -> list:
+    return [
+        discord.SelectOption(label=f"{v} رقاقة", value=str(v), emoji="🪙", default=(v == chips))
+        for v in CHIP_VALUES
+    ]
+
+
+class RouletteNumberModal(ui.Modal, title="رقم مباشر"):
+    num_input = ui.TextInput(label="الرقم (0 إلى 36)", placeholder="مثال: 17", required=True, max_length=2)
+
+    def __init__(self, view):
+        super().__init__()
+        self.rv = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = (self.num_input.value or "").strip()
+        if not raw.isdigit():
+            await interaction.response.send_message("❌ أدخل رقمًا صحيحًا.", ephemeral=True)
+            return
+        n = int(raw)
+        if n > 36:
+            await interaction.response.send_message("❌ الرقم بين 0 و 36.", ephemeral=True)
+            return
+        self.rv.bet_key = "straight"
+        self.rv.bet_value = n
+        await self.rv.refresh(
+            interaction,
+            msg=f"🎯 الرهن: رقم مباشر **{n}** — العائد **35:1**",
+            color=COLOR_INFO,
+        )
+
+
+class RouletteBetSelect(ui.Select):
+    def __init__(self, view):
+        super().__init__(
+            placeholder="🎰 نوع الرهان...", min_values=1, max_values=1,
+            options=_bet_options(view.bet_key, view.bet_value), row=0,
+        )
+        self.rv = view
+
+    def sync(self):
+        self.options = _bet_options(self.rv.bet_key, self.rv.bet_value)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.rv.owner_id:
+            await interaction.response.send_message("❌ هذه ليست لعبتك.", ephemeral=True)
+            return
+        if self.rv.finished:
+            await interaction.response.send_message("❌ انتهت الجولة — اضغط «رصيد جديد».", ephemeral=True)
+            return
+        key = self.values[0]
+        if key == "straight":
+            await interaction.response.send_modal(RouletteNumberModal(self.rv))
+            return
+        self.rv.bet_key = key
+        self.rv.bet_value = None
+        await self.rv.refresh(
+            interaction,
+            msg=f"🎯 الرهن: {BETS[key]['emoji']} **{BETS[key]['label']}** — {BETS[key]['desc']}",
+            color=COLOR_INFO,
+        )
+
+
+class RouletteChipSelect(ui.Select):
+    def __init__(self, view):
+        super().__init__(
+            placeholder="🪙 قيمة الرقاقة...", min_values=1, max_values=1,
+            options=_chip_options(view.chips), row=1,
+        )
+        self.rv = view
+
+    def sync(self):
+        self.options = _chip_options(self.rv.chips)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.rv.owner_id:
+            await interaction.response.send_message("❌ هذه ليست لعبتك.", ephemeral=True)
+            return
+        if self.rv.finished:
+            await interaction.response.send_message("❌ انتهت الجولة — اضغط «رصيد جديد».", ephemeral=True)
+            return
+        self.rv.chips = int(self.values[0])
+        await self.rv.refresh(interaction, msg=f"🪙 الرقاقة: **{self.rv.chips}**", color=COLOR_INFO)
+
+
+class RouletteView(ui.View):
+    CHIP_VALUES = CHIP_VALUES
+
+    def __init__(self, owner_id):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.bankroll = 1000
+        self.chips = 50
+        self.bet_key = "red"
+        self.bet_value = None
+        self.winner = None
+        self.round_no = 0
+        self.history = []
+        self.finished = False
+        self.result_msg = None
+        self.result_color = COLOR_PRIMARY
+
+        self.bet_select = RouletteBetSelect(self)
+        self.chip_select = RouletteChipSelect(self)
+        self.add_item(self.bet_select)
+        self.add_item(self.chip_select)
+
+    # ── بناء الرسالة ────────────────────────────────────────────────────
+    def payload(self, msg: str | None = None):
+        wbuf, wname = wheel_file(self.winner)
+        tbuf, tname = table_file(self.bet_key, self.bet_value)
+
+        bet = BETS[self.bet_key]
+        label = f"{bet['emoji']} {bet['label']}"
+        if self.bet_key == "straight":
+            label = f"🎯 رقم مباشر — **{self.bet_value}**"
+
+        hist = " ".join(f"{number_emoji(n)}{n}" for n in self.history[-8:]) or "—"
+
+        e1 = discord.Embed(title="🎡 روليت أوروبي", color=self.result_color)
+        lines = [
+            f"**الرهان:** {label}   •   **العائد:** {bet['payout']}:1",
+            f"**الرصيد:** 💰 {self.bankroll}   •   **الرقاقة:** 🪙 {self.chips}",
+            f"**الجولة:** {self.round_no}   •   **آخر الفائزين:** {hist}",
+            "",
+            self.result_msg or "اختر نوع الرهان والرقاقات ثم اضغط **دوّر العجلة**.",
+        ]
+        e1.description = "\n".join(lines)
+        e1.set_image(url=f"attachment://{wname}")
+        e1.set_footer(text="روليت أوروبي — الجيب الأخضر 0 يأخذ كل الرهانات الخارجية")
+
+        e2 = discord.Embed(title="🎲 طاولة الرهان", color=COLOR_GOLD)
+        e2.description = (
+            f"**الرهان الحالي:** {label}\n"
+            f"{bet['desc']} — الأرقام التي يغطيها رهنك معلَّمة بإطار ذهبي."
+        )
+        e2.set_image(url=f"attachment://{tname}")
+
+        files = [discord.File(wbuf, filename=wname), discord.File(tbuf, filename=tname)]
+        return [e1, e2], files
+
+    def _normalize_chips(self):
+        if self.chips <= self.bankroll:
+            return
+        affordable = [v for v in CHIP_VALUES if v <= self.bankroll]
+        if affordable:
+            self.chips = max(affordable)
+
+    async def refresh(self, interaction, msg: str | None = None, color: int | None = None):
+        if msg is not None:
+            self.result_msg = msg
+            self.result_color = color or COLOR_PRIMARY
+        self._normalize_chips()
+        self.bet_select.sync()
+        self.chip_select.sync()
+        embeds, files = self.payload()
+        await interaction.response.edit_message(embeds=embeds, attachments=files, view=self)
+
+    def _guard(self, interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            return False
+        if self.finished:
+            return False
+        return True
+
+    # ── الأزرار ─────────────────────────────────────────────────────────
+    @ui.button(label="دوّر العجلة", style=discord.ButtonStyle.primary, emoji="🎡", row=2)
+    async def spin(self, interaction: discord.Interaction, button: ui.Button):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ هذه ليست لعبتك.", ephemeral=True)
+            return
+        if self.finished:
+            await interaction.response.send_message("❌ انتهت الجولة — اضغط «رصيد جديد».", ephemeral=True)
+            return
+        if self.chips > self.bankroll:
+            await interaction.response.send_message(f"❌ رصيدك لا يكفي ({self.bankroll}).", ephemeral=True)
+            return
+
+        self.bankroll -= self.chips
+        self.winner = random.randint(0, 36)
+        self.round_no += 1
+        self.history.append(self.winner)
+        self.history = self.history[-10:]
+
+        covered = bet_numbers(self.bet_key, self.bet_value)
+        if self.winner in covered:
+            payout = self.chips * (1 + BETS[self.bet_key]["payout"])
+            self.bankroll += payout
+            self.result_msg = (
+                f"✅ **فزت!** الكرة سقطت على {number_emoji(self.winner)} **{self.winner}**"
+                f" — ربحت **+{payout}**."
+            )
+            self.result_color = COLOR_SUCCESS
+        else:
+            self.result_msg = (
+                f"❌ **خسرت!** الكرة سقطت على {number_emoji(self.winner)} **{self.winner}**"
+                f" — ذهبت الرقاقة **{self.chips}**."
+            )
+            self.result_color = COLOR_DANGER
+
+        if self.bankroll <= 0:
+            self.result_msg += "\n💸 نفدت رقاقاتك — اضغط **رصيد جديد**."
+
+        await self.refresh(interaction)
+
+    @ui.button(label="رصيد جديد", style=discord.ButtonStyle.success, emoji="💳", row=2)
+    async def reset_bankroll(self, interaction: discord.Interaction, button: ui.Button):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ هذه ليست لعبتك.", ephemeral=True)
+            return
+        self.bankroll = 1000
+        self.chips = 50
+        self.bet_key = "red"
+        self.bet_value = None
+        self.winner = None
+        self.round_no = 0
+        self.history = []
+        self.finished = False
+        for c in self.children:
+            c.disabled = False
+        await self.refresh(interaction, msg="💳 **رصيد جديد:** 1000 رقاقة — حظًا سعيدًا!", color=COLOR_INFO)
+
+    @ui.button(label="إنهاء الجولة", style=discord.ButtonStyle.secondary, emoji="🏁", row=2)
+    async def end_game(self, interaction: discord.Interaction, button: ui.Button):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ هذه ليست لعبتك.", ephemeral=True)
+            return
+        self.finished = True
+        for c in self.children:
+            c.disabled = True
+        await self.refresh(
+            interaction,
+            msg=f"🏁 **انتهت الجولة.** الرصيد النهائي: **{self.bankroll}** بعد {self.round_no} جولات.",
+            color=COLOR_WARNING,
+        )
 
 
 class MultView(ui.View):
